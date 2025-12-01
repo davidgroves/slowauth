@@ -1,19 +1,19 @@
 """DNS server implementation for SlowAuth."""
 
+import asyncio
 import json
 import os
+import signal
 import socket
 import sys
-import threading
 import time
 from datetime import datetime
 from typing import Optional
 
 from dnslib import DNSRecord, QTYPE, RR, A, AAAA, TXT
-from dnslib.server import BaseResolver, DNSServer
 
 
-class SlowAuthResolver(BaseResolver):
+class SlowAuthResolver:
     """DNS resolver for SlowAuth server."""
 
     def __init__(self, domain: str):
@@ -85,12 +85,14 @@ class SlowAuthResolver(BaseResolver):
         except (ValueError, AttributeError):
             return None
 
-    def resolve(self, request: DNSRecord, handler) -> DNSRecord:
-        """Resolve DNS query.
+    async def resolve(self, request: DNSRecord, client_ip: str, client_port: str, protocol: str) -> DNSRecord:
+        """Resolve DNS query asynchronously.
         
         Args:
             request: DNS request record
-            handler: Request handler (contains peer info)
+            client_ip: Client IP address
+            client_port: Client port
+            protocol: Protocol ('UDP' or 'TCP')
             
         Returns:
             DNS response record
@@ -98,32 +100,6 @@ class SlowAuthResolver(BaseResolver):
         # Get query details
         qname = str(request.q.qname).rstrip(".")
         qtype = QTYPE[request.q.qtype]
-        
-        # Extract client IP, port, and protocol from handler
-        try:
-            if hasattr(handler, 'client_address'):
-                client_ip = handler.client_address[0]
-                client_port = handler.client_address[1] if len(handler.client_address) > 1 else 'unknown'
-            elif hasattr(handler, 'request') and hasattr(handler.request, 'getpeername'):
-                peer_info = handler.request.getpeername()
-                client_ip = peer_info[0]
-                client_port = peer_info[1] if len(peer_info) > 1 else 'unknown'
-            else:
-                client_ip = 'unknown'
-                client_port = 'unknown'
-            
-            # Determine protocol
-            if hasattr(handler, 'protocol'):
-                protocol = handler.protocol
-            elif hasattr(handler, 'request') and hasattr(handler.request, 'type'):
-                protocol = 'TCP' if handler.request.type == socket.SOCK_STREAM else 'UDP'
-            else:
-                protocol = 'unknown'
-        except Exception:
-            client_ip = 'unknown'
-            client_port = 'unknown'
-            protocol = 'unknown'
-        
         
         # Parse delay from query name
         delay_ms = self._parse_delay(qname)
@@ -146,9 +122,9 @@ class SlowAuthResolver(BaseResolver):
         self._log_json("query_received", qname, qtype, client_ip, str(client_port), 
                       protocol, delay_ms=delay_ms)
         
-        # Apply delay
+        # Apply delay asynchronously
         if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
+            await asyncio.sleep(delay_ms / 1000.0)
         
         # Get current timestamp with microseconds
         timestamp = time.time()
@@ -187,21 +163,6 @@ class SlowAuthResolver(BaseResolver):
         return reply
 
 
-class TCPResolverWrapper(BaseResolver):
-    """Wrapper resolver that adds TCP protocol info to handler."""
-    
-    def __init__(self, base_resolver: SlowAuthResolver):
-        """Initialize wrapper with base resolver."""
-        self.base_resolver = base_resolver
-    
-    def resolve(self, request: DNSRecord, handler) -> DNSRecord:
-        """Resolve with TCP protocol info."""
-        # Add protocol info to handler
-        if not hasattr(handler, 'protocol'):
-            handler.protocol = 'TCP'
-        return self.base_resolver.resolve(request, handler)
-
-
 class SlowAuthServer:
     """SlowAuth DNS server."""
 
@@ -215,45 +176,86 @@ class SlowAuthServer:
         self.domain = domain
         self.port = port
         self.resolver = SlowAuthResolver(domain)
-        self.tcp_resolver = TCPResolverWrapper(self.resolver)
-        self.udp_sock = None
-        self.running = True
+        self.udp_transport = None
+        self.tcp_server = None
         
-    def _handle_udp(self):
-        """Handle UDP DNS requests."""
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.udp_sock.bind(("", self.port))
-        
-        while self.running:
-            try:
-                self.udp_sock.settimeout(1.0)  # Allow periodic check of self.running
-                data, addr = self.udp_sock.recvfrom(512)
-                request = DNSRecord.parse(data)
-                # Create handler with client address and protocol info
-                handler = type('Handler', (), {
-                    'client_address': addr,
-                    'protocol': 'UDP'
-                })()
-                response = self.resolver.resolve(request, handler)
-                self.udp_sock.sendto(response.pack(), addr)
-            except socket.timeout:
-                continue  # Timeout is expected, check self.running
-            except Exception as e:
-                if self.running:
-                    error_log = {
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                        "event": "udp_error",
-                        "error": str(e),
-                        "protocol": "UDP"
-                    }
-                    print(json.dumps(error_log), file=sys.stderr)
-        
-        if self.udp_sock:
-            self.udp_sock.close()
+    async def _handle_udp_request(self, data: bytes, addr: tuple):
+        """Handle a single UDP DNS request."""
+        try:
+            request = DNSRecord.parse(data)
+            client_ip, client_port = addr
+            response = await self.resolver.resolve(request, client_ip, client_port, "UDP")
+            if self.udp_transport:
+                self.udp_transport.sendto(response.pack(), addr)
+        except Exception as e:
+            error_log = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "event": "udp_error",
+                "error": str(e),
+                "protocol": "UDP",
+                "client_ip": addr[0] if addr else "unknown",
+                "client_port": addr[1] if addr and len(addr) > 1 else "unknown"
+            }
+            print(json.dumps(error_log), file=sys.stderr)
     
-    def start(self):
-        """Start the DNS server."""
+    def _udp_protocol_factory(self):
+        """Create UDP protocol handler."""
+        server = self
+        
+        class UDPProtocol(asyncio.DatagramProtocol):
+            def datagram_received(self, data: bytes, addr: tuple):
+                """Handle received UDP datagram."""
+                # Create task for concurrent handling
+                asyncio.create_task(server._handle_udp_request(data, addr))
+        
+        return UDPProtocol()
+    
+    async def _handle_tcp_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle a TCP client connection."""
+        try:
+            addr = writer.get_extra_info('peername')
+            client_ip = addr[0] if addr else 'unknown'
+            client_port = addr[1] if addr and len(addr) > 1 else 'unknown'
+            
+            while True:
+                # Read length prefix (2 bytes, network byte order)
+                length_data = await reader.readexactly(2)
+                if len(length_data) < 2:
+                    break  # Connection closed
+                
+                # Get message length
+                msg_length = int.from_bytes(length_data, 'big')
+                
+                # Read DNS message
+                data = await reader.readexactly(msg_length)
+                
+                # Parse and resolve
+                request = DNSRecord.parse(data)
+                response = await self.resolver.resolve(request, client_ip, str(client_port), "TCP")
+                
+                # Send response with length prefix
+                response_data = response.pack()
+                writer.write(len(response_data).to_bytes(2, 'big') + response_data)
+                await writer.drain()
+        except asyncio.IncompleteReadError:
+            # Client closed connection
+            pass
+        except Exception as e:
+            error_log = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "event": "tcp_error",
+                "error": str(e),
+                "protocol": "TCP",
+                "client_ip": client_ip if 'client_ip' in locals() else "unknown",
+                "client_port": client_port if 'client_port' in locals() else "unknown"
+            }
+            print(json.dumps(error_log), file=sys.stderr)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    
+    async def start(self):
+        """Start the DNS server asynchronously."""
         startup_log = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             "event": "server_start",
@@ -265,37 +267,80 @@ class SlowAuthServer:
         }
         print(json.dumps(startup_log))
         
-        # Start UDP server in a thread
-        udp_thread = threading.Thread(target=self._handle_udp, daemon=True)
-        udp_thread.start()
-        
-        # Create TCP server (DNSServer handles TCP)
-        tcp_server = DNSServer(
-            self.tcp_resolver,
-            port=self.port,
-            address="",
-            tcp=True,
-            logger=None  # We handle our own logging
-        )
-        
-        # Start TCP server (blocks until interrupted)
+        # Start UDP server
+        loop = asyncio.get_running_loop()
         try:
-            tcp_server.start()
-        except KeyboardInterrupt:
-            shutdown_log = {
+            self.udp_transport, _ = await loop.create_datagram_endpoint(
+                self._udp_protocol_factory,
+                local_addr=("0.0.0.0", self.port),
+                family=socket.AF_INET
+            )
+            udp_addr = self.udp_transport.get_extra_info('sockname')
+            udp_log = {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                "event": "server_shutdown",
-                "message": "Shutting down..."
+                "event": "udp_server_started",
+                "address": f"{udp_addr[0]}:{udp_addr[1]}" if udp_addr else "unknown",
+                "protocol": "UDP"
             }
-            print(json.dumps(shutdown_log))
-            self.running = False
-            tcp_server.stop()
-            if self.udp_sock:
-                self.udp_sock.close()
+            print(json.dumps(udp_log))
+        except Exception as e:
+            error_log = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "event": "udp_server_error",
+                "error": str(e),
+                "protocol": "UDP"
+            }
+            print(json.dumps(error_log), file=sys.stderr)
+            raise
+        
+        # Start TCP server
+        try:
+            self.tcp_server = await asyncio.start_server(
+                self._handle_tcp_client,
+                host="0.0.0.0",
+                port=self.port,
+                family=socket.AF_INET
+            )
+            tcp_addrs = [sock.getsockname() for sock in self.tcp_server.sockets]
+            tcp_log = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "event": "tcp_server_started",
+                "addresses": [f"{addr[0]}:{addr[1]}" for addr in tcp_addrs],
+                "protocol": "TCP"
+            }
+            print(json.dumps(tcp_log))
+        except Exception as e:
+            error_log = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                "event": "tcp_server_error",
+                "error": str(e),
+                "protocol": "TCP"
+            }
+            print(json.dumps(error_log), file=sys.stderr)
+            raise
+        
+        # Run TCP server (UDP is already running via the transport)
+        # serve_forever() will keep the server running
+        await self.tcp_server.serve_forever()
+    
+    async def stop(self):
+        """Stop the DNS server."""
+        shutdown_log = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "event": "server_shutdown",
+            "message": "Shutting down..."
+        }
+        print(json.dumps(shutdown_log))
+        
+        if self.udp_transport:
+            self.udp_transport.close()
+        if self.tcp_server:
+            self.tcp_server.close()
+            await self.tcp_server.wait_closed()
 
 
-def main():
-    """Main entry point."""
+async def _main_async():
+    """Async main entry point."""
     # Check for required domain environment variable
     domain: str | None = os.environ.get("SLOWAUTH_DOMAIN")
     if not domain:
@@ -320,7 +365,47 @@ def main():
     
     # All checks passed, start the server
     server = SlowAuthServer(domain, port=port)
-    server.start()
+    
+    # Set up signal handlers for graceful shutdown
+    loop = asyncio.get_event_loop()
+    shutdown_event = asyncio.Event()
+    
+    def signal_handler():
+        shutdown_event.set()
+    
+    # Handle SIGINT (Ctrl+C) and SIGTERM (if available on platform)
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
+    except (NotImplementedError, ValueError):
+        # Signal handlers not available on this platform (e.g., Windows)
+        pass
+    
+    server_task = None
+    try:
+        # Start server and wait for shutdown signal
+        server_task = asyncio.create_task(server.start())
+        await shutdown_event.wait()
+        server_task.cancel()
+        try:
+            await server_task
+        except asyncio.CancelledError:
+            pass
+    except KeyboardInterrupt:
+        # Fallback for platforms without signal handlers
+        if server_task:
+            server_task.cancel()
+            try:
+                await server_task
+            except asyncio.CancelledError:
+                pass
+    finally:
+        await server.stop()
+
+
+def main():
+    """Main entry point."""
+    asyncio.run(_main_async())
 
 
 if __name__ == "__main__":
