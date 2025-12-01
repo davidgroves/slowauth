@@ -1,0 +1,23 @@
+[project]
+name = "slowauth"
+version = "0.1.0"
+description = "Authoritative DNS server with configurable response delays"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dnslib>=0.9.0",
+]
+
+[project.scripts]
+slowauth = "slowauth.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "ruff>=0.14.7",
+    "ty>=0.0.1a29",
+]
+
