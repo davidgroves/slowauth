@@ -1,0 +1,65 @@
+name: Docker Image CI
+
+# Triggers the workflow on push events to the 'main' branch or when a tag is pushed
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - 'v*.*.*' # For version tags like v1.0.0
+  pull_request:
+    branches: [ "main" ]
+
+# Define environment variables used throughout the workflow
+env:
+  REGISTRY: ghcr.io
+  # GITHUB_REPOSITORY is a built-in context variable (e.g., 'owner/repo-name')
+  IMAGE_NAME: ${{ github.repository }} 
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    # Permissions required to use the GITHUB_TOKEN for pushing to GHCR
+    permissions:
+      contents: read
+      packages: write
+      # Optional: To read metadata from release/issue comments
+      # issues: write 
+
+    steps:
+      - name: Checkout repository
+        # Action to check out the code
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        # Action to log into the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          # Use the default GitHub token for password and the user/actor for username
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        # Action to automatically generate useful tags/labels from Git context
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Build and push Docker image
+        # Action to build the image and push it to the registry
+        uses: docker/build-push-action@v5
+        with:
+          context: . # The directory containing the Dockerfile (defaults to the repo root)
+          push: ${{ github.event_name != 'pull_request' }} # Only push on 'push' events, not 'pull_request'
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Use this if your Dockerfile is not in the root
+          # file: ./path/to/my/Dockerfile
