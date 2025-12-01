@@ -130,6 +130,10 @@ class SlowAuthResolver(BaseResolver):
         
         # Create response
         reply = request.reply()
+        # Clear AD (Authenticated Data) flag - we don't implement DNSSEC
+        reply.header.ad = False
+        # Clear RA (Recursion Available) flag - recursion is not available
+        reply.header.ra = False
         
         if delay_ms is None:
             # Invalid subdomain, return SERVFAIL
