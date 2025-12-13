@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import signal
 import socket
 import sys
@@ -52,6 +53,10 @@ class SlowAuthResolver:
     def _parse_delay(self, qname: str) -> Optional[int]:
         """Parse delay value from query name.
         
+        Supports two formats:
+        - Integer: <integer>.<domain> - fixed delay in milliseconds
+        - Random range: random-<low>-<high>.<domain> - random delay between low and high milliseconds
+        
         Args:
             qname: Query name string
             
@@ -74,7 +79,33 @@ class SlowAuthResolver:
             # Remove domain suffix to get subdomain
             subdomain = query_text[: -(len(self.domain) + 1)]
             
-            # Parse integer from subdomain
+            # Check for random-LOW-HIGH pattern
+            if subdomain.startswith("random-"):
+                try:
+                    # Extract the range part (everything after "random-")
+                    range_part = subdomain[7:]  # len("random-") = 7
+                    
+                    # Split by hyphen to get LOW and HIGH
+                    parts = range_part.split("-")
+                    if len(parts) != 2:
+                        return None
+                    
+                    low_ms = int(parts[0])
+                    high_ms = int(parts[1])
+                    
+                    # Validate range
+                    if low_ms < 0 or high_ms < 0:
+                        return None
+                    if low_ms > high_ms:
+                        return None
+                    
+                    # Generate random delay between low and high (inclusive)
+                    delay_ms = random.randint(low_ms, high_ms)
+                    return delay_ms
+                except (ValueError, IndexError):
+                    return None
+            
+            # Parse integer from subdomain (original behavior)
             delay_ms = int(subdomain)
             
             # Ensure non-negative
@@ -263,7 +294,7 @@ class SlowAuthServer:
             "port": self.port,
             "protocols": ["UDP", "TCP"],
             "message": f"Starting SlowAuth DNS server for domain: {self.domain}",
-            "format": "<integer>.<domain> where integer is delay in milliseconds"
+            "format": "<integer>.<domain> or random-<low>-<high>.<domain> where integer/low/high is delay in milliseconds"
         }
         print(json.dumps(startup_log))
         
